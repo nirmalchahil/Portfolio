@@ -1034,7 +1034,9 @@ const MediaDB = {
   _tx(mode){ return this.db.transaction("media", mode).objectStore("media"); },
   put(id, blob, meta){
     return new Promise(res => { if(!this.db) return res(false);
-      const tx = this._tx("readwrite"); const req = tx.put({ id, blob, meta });
+      /* the store has no keyPath, so the key MUST be passed explicitly — without it
+         every put throws DataError and the image blob is silently lost */
+      const tx = this._tx("readwrite"); const req = tx.put({ id, blob, meta }, id);
       req.onsuccess = () => res(true); req.onerror = () => res(false); });
   },
   get(id){
@@ -1095,13 +1097,13 @@ const Media = {
           const q = mime === "image/png" ? 0.9 : 0.82;
           const cb = (blob) => {
             URL.revokeObjectURL(url);
-            if(!blob || blob.size > file.size){ return resolve({ blob: file, w: img.width, h: img.height, size: file.size, mime: file.type }); }
-            resolve({ blob, w, h, size: blob.size, mime });
+            if(!blob || blob.size > file.size){ return resolve({ blob: file, w: img.width, h: img.height, size: file.size, mime: file.type, decode: true }); }
+            resolve({ blob, w, h, size: blob.size, mime, decode: true });
           };
           if(cv.toBlob) cv.toBlob(cb, mime, q); else cb(new Blob([file], {type: file.type}));
-        }catch(e){ URL.revokeObjectURL(url); resolve({ blob: file, w: 0, h: 0, size: file.size, mime: file.type }); }
+        }catch(e){ URL.revokeObjectURL(url); resolve({ blob: file, w: 0, h: 0, size: file.size, mime: file.type, decode: false }); }
       };
-      img.onerror = () => { URL.revokeObjectURL(url); resolve({ blob: file, w: 0, h: 0, size: file.size, mime: file.type }); };
+      img.onerror = () => { URL.revokeObjectURL(url); resolve({ blob: file, w: 0, h: 0, size: file.size, mime: file.type, decode: false }); };
       img.src = url;
     });
   },
@@ -1144,7 +1146,7 @@ const Media = {
     let payload, meta;
     if(isImage){
       payload = await this.compressImage(file);
-      meta = { id, name: file.name, type: "image", mime: payload.mime, size: payload.size, w: payload.w, h: payload.h, date: new Date().toISOString(), url: "" };
+      meta = { id, name: file.name, type: "image", mime: payload.mime, size: payload.size, w: payload.w, h: payload.h, date: new Date().toISOString(), url: "", decodeWarn: payload.decode === false };
     } else {
       payload = { blob: file };
       const thumb = await this.videoThumb(file);
@@ -1155,10 +1157,11 @@ const Media = {
       meta = await Store.adapter.putMedia(id, payload.blob, meta);
     } else {
       const ok = await MediaDB.put(id, payload.blob, meta);
-      if(!ok && MediaDB.ok === false){ /* IDB unavailable: keep small files as dataURL in metadata */
-        if(payload.size < 2 * 1024 * 1024){
+      if(!ok){ /* IDB unavailable or the write failed: keep small files as dataURL in metadata */
+        if(payload.size <= 2 * 1024 * 1024){
           meta.dataURL = await this._loadFile(payload.blob);
-        } else { throw new Error("This browser blocked secure media storage. Try Chrome/Edge."); }
+          meta.storedIn = "inline";
+        } else { throw new Error("This browser blocked secure media storage (IndexedDB). Try Chrome, or clear this site's browser data. Images up to 2 MB are saved automatically."); }
       }
     }
     onProgress && onProgress(90, "Saving…");
@@ -1770,6 +1773,14 @@ const PUB = {
     scope.querySelectorAll("video[data-mid]").forEach(vd => {
       Media.urlWithFallback(vd.dataset.mid).then(u => { if(u) vd.src = u; });
     });
+    scope.querySelectorAll(".l-thumb[data-mid]").forEach(el => {
+      Media.urlWithFallback(el.dataset.mid).then(u => {
+        if(!u) return;
+        el.style.backgroundImage = "url(\"" + u + "\")";
+        el.style.backgroundSize = "cover"; el.style.backgroundPosition = "center";
+        const ic = el.querySelector("svg"); if(ic) ic.style.display = "none";
+      });
+    });
     scope.querySelectorAll(".skel-fill[data-mid]").forEach(el => {
       Media.urlWithFallback(el.dataset.mid).then(u => {
         if(!u) return;
@@ -2299,7 +2310,9 @@ const ADM = {
   /* ---------------- PROFILE (wizard + editor) ---------------- */
   page_profile(){
     if(!profileDone()) return this.wizardHtml();
-    const p = State.profile;
+    /* render the in-progress draft when it belongs to the current profile,
+       so re-renders (e.g. after an image upload) keep unsaved edits visible */
+    const p = (ProfileEdit.cur && ProfileEdit.builtFrom === State.profile) ? ProfileEdit.cur : State.profile;
     const socials = Object.keys(SOC_META).map(key =>
       '<div class="row-grid" style="gap:12px 16px"><div class="field"><label>'+SOC_META[key].label+'</label><input class="input" data-pf="socials.'+key+'" value="'+U.esc(p.socials[key]||"")+'" placeholder="https://…"></div></div>').join("");
     const xp = (p.experience||[]).map((x, i) =>
@@ -2355,7 +2368,7 @@ const ADM = {
     );
   },
   imgField(key, label){
-    const p = State.profile;
+    const p = (ProfileEdit.cur && ProfileEdit.builtFrom === State.profile) ? ProfileEdit.cur : State.profile;
     const id = p[key];
     const round = key === "avatar";
     const inner = id
@@ -2372,7 +2385,12 @@ const ADM = {
   bind_profile(){
     const form = document.getElementById("pf-form");
     if(!form) return;
-    ProfileEdit.cur = JSON.parse(JSON.stringify(State.profile));
+    /* only re-clone when the underlying profile object actually changed (save/restore/wipe).
+       Re-cloning on every render wiped unsaved edits and uploaded image ids mid-edit. */
+    if(!ProfileEdit.cur || ProfileEdit.builtFrom !== State.profile){
+      ProfileEdit.cur = JSON.parse(JSON.stringify(State.profile || {}));
+      ProfileEdit.builtFrom = State.profile;
+    }
     Modal._dirty = null;
     form.addEventListener("input", () => {
       form.querySelectorAll("[data-pf]").forEach(el => {
@@ -2545,7 +2563,7 @@ const ADM = {
   }
 };
 const Wiz = { step: 1, data: null };
-const ProfileEdit = { cur: null };
+const ProfileEdit = { cur: null, builtFrom: null };
 /* safe form field accessors (f.title / f.name clash with HTMLFormElement props) */
 function FE(f, n){ const el = f.elements && f.elements.namedItem(n); return el || null; }
 function FV(f, n){ const el = FE(f, n); return el ? el.value : ""; }
@@ -2723,10 +2741,11 @@ ADM.peAddImages = async function(files, bd){
   for(const f of files){
     try{
       toast("Uploading "+f.name+"…", "info");
-      await Media.upload(f, (pct, label) => { /* progress in toast area */ });
+      const m = await Media.upload(f, (pct, label) => { /* progress in toast area */ });
       PostEdit.cur.images.push(State.media[0].id);
       ADM.renderPeImgs(bd); ADM.pePreview(bd);
       toast("Image uploaded.", "ok");
+      ADM.uploadWarn(m);
     }catch(err){ toast(err.message, "err"); }
   }
 };
@@ -2887,7 +2906,7 @@ ADM.pejThumb = async function(file, bd){
   if(!file) return;
   try{
     toast("Uploading thumbnail…", "info");
-    await Media.upload(file);
+    const m = await Media.upload(file);
     ProjEdit.cur.thumbnail = State.media[0].id;
     const prev = bd.querySelector("#pej-thumb .u-prev");
     prev.classList.remove("skel");
@@ -2897,15 +2916,17 @@ ADM.pejThumb = async function(file, bd){
     if(!del) bd.querySelector("#pej-thumb .u-acts").insertAdjacentHTML("afterbegin", '<button class="btn btn-outline btn-sm" type="button" data-act="pej-thumb-del">Remove</button>');
     ADM.pejPreview(bd);
     toast("Image uploaded.", "ok");
+    ADM.uploadWarn(m);
   }catch(err){ toast(err.message, "err"); }
 };
 ADM.pejGallery = async function(files, bd){
   for(const f of files){
     try{
-      await Media.upload(f);
+      const m = await Media.upload(f);
       ProjEdit.cur.images.push(State.media[0].id);
       ADM.renderPejImgs(bd); ADM.pejPreview(bd);
       toast("Image uploaded.", "ok");
+      ADM.uploadWarn(m);
     }catch(err){ toast(err.message, "err"); }
   }
 };
@@ -3063,7 +3084,7 @@ ADM.openSkillEditor = function(id){
 ADM.page_media = function(){
   return (
     '<div class="card panel">'+
-      '<label class="upl-zone" id="media-drop" data-act="media-pick" style="cursor:pointer">'+
+      '<label class="upl-zone" id="media-drop" style="cursor:pointer">'+
         I("upload")+"<b>Upload images or videos</b>"+
         "<span>Click to browse · drag & drop on desktop · picks from gallery on mobile · optimized automatically</span>"+
         '<input type="file" id="media-file" accept="image/*,video/*" multiple hidden>'+
@@ -3076,6 +3097,9 @@ ADM.page_media = function(){
       '<div id="media-grid">'+this.mediaGridHtml("")+"</div>"+
       (Store.mode === "local"
         ? '<div class="info-note n-warn" style="margin-top:18px;margin-bottom:0">'+I("alert")+"<div><i class='nn-t'>Local Mode storage</i>Files are stored in this browser (IndexedDB). They are not synced to other devices and cannot be shared by URL — “Copy URL” works in Cloud Mode. Keep regular backups (Backup / Restore).</div></div>"
+        : "")+
+      (Store.mode === "local" && !MediaDB.ok
+        ? '<div class="info-note n-warn" style="margin-top:10px;margin-bottom:0">'+I("alert")+"<div><i class='nn-t'>Storage warning</i>This browser blocked IndexedDB, so images up to 2 MB are stored inside the page data instead (less efficient, can fill browser storage). Chrome or Edge work best.</div></div>"
         : "")+
     "</div>"
   );
@@ -3124,6 +3148,7 @@ ADM.bind_media = function(){
   input.addEventListener("change", e => ADM.uploadFiles(e.target.files));
   PUB.hydrate(document.getElementById("media-grid"));
 };
+ADM.uploadWarn = function(m){ if(m && m.decodeWarn) toast("Image saved, but this browser can't preview this format (e.g. HEIC from iPhone). Convert it to JPG and re-upload.", "err"); };
 ADM.uploadFiles = async function(files){
   const prog = document.getElementById("media-progress");
   const bar = document.getElementById("media-progress-bar");
@@ -3138,6 +3163,7 @@ ADM.uploadFiles = async function(files){
       if(bar) bar.style.width = "100%";
       if(lbl) lbl.textContent = "Done: " + m.name;
       toast((m.type==="video"?"Video":"Image") + " uploaded.", "ok");
+      ADM.uploadWarn(m);
       const grid = document.getElementById("media-grid");
       if(grid){ grid.innerHTML = ADM.mediaGridHtml((document.querySelector('[data-search="media"]')||{}).value || ""); PUB.hydrate(grid); }
     }catch(err){
@@ -3851,16 +3877,16 @@ const ACTS = {
   logout: (e, t) => ADM.doLogout(),
   /* --- profile --- */
   "pf-cancel": (e, t) => {
-    const ok = confirmDlg ? null : null;
     confirmDlg({ title:"Discard changes?", message:"Your profile edits will be reverted.", danger:true, confirmText:"Discard" })
-      .then(res => { if(res){ Modal._dirty = null; ADM.show("profile"); toast("Changes discarded.", "info"); } });
+      .then(res => { if(res){ ProfileEdit.cur = null; ProfileEdit.builtFrom = null; Modal._dirty = null; ADM.show("profile"); toast("Changes discarded.", "info"); } });
   },
   "pf-img-replace": (e, t) => ADM.pickImage(file => (async () => {
     try{
       toast("Uploading…", "info");
-      await Media.upload(file);
+      const m = await Media.upload(file);
       ProfileEdit.cur[t.dataset.key] = State.media[0].id;
       ADM.pfSetImage(t.dataset.key, State.media[0].id);
+      ADM.uploadWarn(m);
     }catch(err){ toast(err.message, "err"); }
   })()),
   "pf-img-remove": (e, t) => {
@@ -3883,10 +3909,11 @@ const ACTS = {
   "wiz-img-replace": (e, t) => ADM.pickImage(file => (async () => {
     try{
       toast("Uploading…", "info");
-      await Media.upload(file);
+      const m = await Media.upload(file);
       Wiz.data[t.dataset.key] = State.media[0].id;
       ADM.show("profile");
       toast("Image uploaded.", "ok");
+      ADM.uploadWarn(m);
     }catch(err){ toast(err.message, "err"); }
   })()),
   "wiz-img-remove": (e, t) => {
@@ -4180,6 +4207,8 @@ const ACTS = {
       if(!ok) return;
       await Data.wipeAll();
       toast("All data erased. Set up your profile again.", "info");
+      ProfileEdit.cur = null; ProfileEdit.builtFrom = null;
+      Wiz.data = null;
       ADM.pageKey = "profile";
       ADM.render();
     });
@@ -4190,10 +4219,17 @@ const ACTS = {
   "bk-restore-merge": (e, t) => ADM.bkRestore(false)
 };
 ADM.pickImage = function(cb){
+  /* Attach the input to the DOM before clicking — on several mobile browsers the picker
+     never opens for a detached input, which made "upload photo" look dead. */
   const inp = document.createElement("input");
   inp.type = "file"; inp.accept = "image/*";
-  inp.onchange = () => { if(inp.files[0]) cb(inp.files[0]); };
-  inp.click();
+  inp.style.cssText = "position:fixed;left:-9999px;top:-9999px;width:2px;height:2px;opacity:0;border:0;padding:0;margin:0;";
+  document.body.appendChild(inp);
+  let closed = false;
+  const cleanup = () => { if(closed) return; closed = true; setTimeout(() => { try{ inp.remove(); }catch(e){} }, 500); };
+  inp.addEventListener("change", () => { const f = inp.files && inp.files[0]; cleanup(); if(f) cb(f); });
+  try{ inp.addEventListener("cancel", cleanup); }catch(e){}
+  try{ inp.click(); }catch(e){ cleanup(); toast("Couldn't open the file picker on this device. Try uploading from the Media page instead.", "err"); }
 };
 ADM.openSide = function(){
   const s = document.getElementById("adm-side"), sc = document.querySelector(".side-scrim");
@@ -4466,7 +4502,7 @@ async function init(){
     }, 150));
     setupDelegation();
     Router.route();
-    window.__APP__ = { State, Data, Store, Media, APP_CONFIG, Backup, PUB, ADM }; /* debug handle */
+    window.__APP__ = { State, Data, Store, Media, APP_CONFIG, Backup, PUB, ADM, MediaDB, Auth, ProfileEdit, PostEdit, ProjEdit, Wiz }; /* debug handle */
   }catch(err){
     console.error("Init error:", err);
     document.body.innerHTML = '<div style="padding:40px;text-align:center;font-family:sans-serif;color:#b00020">Something went wrong while starting the app: ' + U.esc(err.message) + '<br>Try refreshing. If the problem persists, clear this site\'s browser data.</div>';
